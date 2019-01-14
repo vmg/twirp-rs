@@ -1,4 +1,9 @@
+extern crate prost_build;
+extern crate proc_macro2;
+
 use prost_build::{Method, Service, ServiceGenerator};
+use proc_macro2::{TokenStream, Ident, Span, Literal};
+use std::fmt::Write;
 
 #[derive(Default)]
 pub struct TwirpServiceGenerator {
@@ -7,122 +12,182 @@ pub struct TwirpServiceGenerator {
 }
 
 impl TwirpServiceGenerator {
-    pub fn new() -> TwirpServiceGenerator { Default::default() }
+    pub fn new() -> Self { Default::default() }
 
-    fn prost_twirp_mod(&self) -> &str { if self.embed_client { "twirp_rs" } else { "::twirp_rs" } }
+    fn ident(&self, id: &str) -> Ident {
+        Ident::new(id, Span::call_site())
+    }
 
-    fn generate_type_aliases(&mut self, buf: &mut String) {
-        if !self.type_aliases_generated {
-            self.type_aliases_generated = true;
-            buf.push_str(&format!(
-                "\n\
-                pub type PTReq<I> = {0}::PTReq<I>;\n\
-                pub type PTRes<O> = {0}::PTRes<O>;\n",
-                self.prost_twirp_mod()));
+    fn service_name(&self, service: &Service) -> Ident {
+        self.ident(&service.name)
+    }
+
+    fn client_name(&self, service: &Service) -> Ident {
+        self.ident(&format!("{}Client", service.name))
+    }
+
+    fn server_name(&self, service: &Service) -> Ident {
+        self.ident(&format!("{}Server", service.name))
+    }
+
+    fn twirp_uri(&self, service: &Service, method: &Method) -> Literal {
+        Literal::string(&format!("/twirp/{}.{}/{}", service.package, service.proto_name, method.proto_name))
+    }
+
+    fn twirp_mod(&self) -> TokenStream {
+        let modname = Ident::new("twirp_rs", Span::call_site());
+        if self.embed_client {
+            quote!{ #modname }
+        } else {
+            quote!{ ::#modname }
         }
     }
 
-    fn generate_main_trait(&self, service: &Service, buf: &mut String) {
-        buf.push_str("\n");
-        service.comments.append_with_indent(0, buf);
-        buf.push_str(&format!("pub trait {} {{", service.name));
-        for method in service.methods.iter() {
-            buf.push_str("\n");
-            method.comments.append_with_indent(1, buf);
-            buf.push_str(&format!("    {};\n", self.method_sig(method)));
+    fn generate_type_aliases(&self) -> TokenStream {
+        let module = self.twirp_mod();
+
+        quote! {
+            pub type PTReq<I> = #module::PTReq<I>;
+            pub type PTRes<O> = #module::PTRes<O>;
         }
-        buf.push_str("}\n");
     }
 
-    fn method_sig(&self, method: &Method) -> String {
-        format!("fn {0}(&self, i: {1}::PTReq<{2}>) -> {1}::PTRes<{3}>",
-            method.name, self.prost_twirp_mod(), method.input_type, method.output_type)
-    }
+    fn method_sig(&self, method: &Method) -> TokenStream {
+        let name = self.ident(&method.name);
+        let module = self.twirp_mod();
+        let input_type = self.ident(&method.input_type);
+        let output_type = self.ident(&method.output_type);
 
-    fn generate_main_impl(&self, service: &Service, buf: &mut String) {
-        buf.push_str(&format!(
-            "\n\
-            impl {0} {{\n    \
-                pub fn new_client(client: ::hyper::Client<::hyper::client::HttpConnector, ::hyper::Body>, root_url: &str) -> Box<{0}> {{\n        \
-                    Box::new({0}Client({1}::HyperClient::new(client, root_url)))\n    \
-                }}\n    \
-                pub fn new_server<T: 'static + {0}>(v: T) -> Box<::hyper::service::Service<ReqBody=::hyper::Body,\n            \
-                        ResBody=::hyper::Body, Error=::hyper::Error, Future=Box<::futures::Future<Item=::hyper::Response<::hyper::Body>, Error=::hyper::Error>>>> {{\n        \
-                    Box::new({1}::HyperServer::new({0}Server(::std::sync::Arc::new(v))))\n    \
-                }}\n\
-            }}\n",
-            service.name, self.prost_twirp_mod()));
-    }
-
-    fn generate_client_struct(&self, service: &Service, buf: &mut String) {
-        buf.push_str(&format!(
-            "\npub struct {}Client(pub {}::HyperClient);\n",
-            service.name, self.prost_twirp_mod()));
-    }
-
-    fn generate_client_impl(&self, service: &Service, buf: &mut String) {
-        buf.push_str(&format!("\nimpl {0} for {0}Client {{", service.name));
-        for method in service.methods.iter() {
-            buf.push_str(&format!(
-                "\n    {} {{\n        \
-                    self.0.go(\"/twirp/{}.{}/{}\", i)\n    \
-                }}\n", self.method_sig(method), service.package, service.proto_name, method.proto_name));
+        quote! {
+            fn #name(&self, i: #module::PTReq<#input_type>) -> #module::PTRes<#output_type>
         }
-        buf.push_str("}\n");
     }
 
-    fn generate_server_struct(&self, service: &Service, buf: &mut String) {
-        buf.push_str(&format!(
-            "\npub struct {0}Server<T: 'static + {0}>(::std::sync::Arc<T>);\n",
-            service.name));
-    }
+    fn generate_main_trait(&self, service: &Service) -> TokenStream {
+        let name = self.service_name(service);
+        let methods = service.methods.iter().map(|method| self.method_sig(method));
 
-    fn generate_server_impl(&self, service: &Service, buf: &mut String) {
-        buf.push_str(&format!(
-            "\n\
-            impl<T: 'static + {0}> {1}::HyperService for {0}Server<T> {{\n    \
-                fn handle(&self, req: {1}::ServiceRequest<Vec<u8>>) -> {1}::PTRes<Vec<u8>> {{\n        \
-                    use ::futures::Future;\n        \
-                    let static_service = self.0.clone();\n        \
-                    match (req.method.clone(), req.uri.path()) {{",
-            service.name, self.prost_twirp_mod()));
-        // Make match arms for each type
-        for method in service.methods.iter() {
-            buf.push_str(&format!(
-                "\n            \
-                (::hyper::Method::POST, \"/twirp/{}.{}/{}\") =>\n                \
-                    Box::new(::futures::future::result(req.to_proto()).and_then(move |v| static_service.{}(v)).and_then(|v| v.to_proto_raw())),",
-                service.package, service.proto_name, method.proto_name, method.name));
+        quote! {
+            pub trait #name {
+                #( #methods; )*
+            }
         }
-        // Final 404 arm and end fn
-        buf.push_str(&format!(
-            "\n            \
-                        _ => Box::new(::futures::future::ok({0}::TwirpError::new(::hyper::StatusCode::NOT_FOUND, \"not_found\", \"Not found\").to_resp_raw()))\n        \
-                    }}\n    \
-                }}\n\
-            }}",
-            self.prost_twirp_mod()));
+    }
+
+    fn generate_main_impl(&self, service: &Service) -> TokenStream {
+        let name = self.service_name(service);
+        let server_name = self.server_name(service);
+        let client_name = self.client_name(service);
+        let module = self.twirp_mod();
+
+        quote! {
+            impl #name {
+                pub fn new_client(client: ::hyper::Client<::hyper::client::HttpConnector, ::hyper::Body>, root_url: &str) -> Box<#name> {
+                    Box::new(#client_name(#module::HyperClient::new(client, root_url)))
+                }
+
+                pub fn new_server<T: 'static + #name>(v: T) ->
+                    Box<::hyper::service::Service<
+                        ReqBody=::hyper::Body,
+                        ResBody=::hyper::Body,
+                        Error=::hyper::Error,
+                        Future=Box<::futures::Future<Item=::hyper::Response<::hyper::Body>, Error=::hyper::Error>>
+                    >> {
+                    Box::new(#module::HyperServer::new(#server_name(::std::sync::Arc::new(v))))
+                }
+            }
+        }
+    }
+
+    fn generate_client_struct(&self, service: &Service) -> TokenStream {
+        let client_name = self.client_name(service);
+        let module = self.twirp_mod();
+
+        quote! {
+            pub struct #client_name(pub #module::HyperClient);
+        }
+    }
+
+    fn client_method(&self, service: &Service, method: &Method) -> TokenStream {
+        let signature = self.method_sig(method);
+        let uri = self.twirp_uri(service, method);
+
+        quote! {
+            #signature {
+                self.0.go(#uri, i)
+            }
+        }
+    }
+
+    fn generate_client_impl(&self, service: &Service) -> TokenStream {
+        let name = self.service_name(service);
+        let client_name = self.client_name(service);
+        let methods = service.methods.iter().map(|method| self.client_method(service, method));
+
+        quote! {
+            impl #name for #client_name {
+                #( #methods )*
+            }
+        }
+    }
+
+    fn server_handler(&self, service: &Service, method: &Method) -> TokenStream {
+        let uri = self.twirp_uri(service, method);
+        let method = self.ident(&method.name);
+
+        quote! {
+            (::hyper::Method::POST, #uri) =>
+                Box::new(::futures::future::result(req.to_proto()).and_then(move |v| static_service.#method(v)).and_then(|v| v.to_proto_raw()))
+        }
+    }
+
+    fn generate_server_impl(&self, service: &Service) -> TokenStream {
+        let module = self.twirp_mod();
+        let name = self.service_name(service);
+        let server_name = self.server_name(service);
+        let handlers = service.methods.iter().map(|method| self.server_handler(service, method));
+
+        quote! {
+            impl<T: 'static + #name> #module::HyperService for #server_name<T> {
+                fn handle(&self, req: #module::ServiceRequest<Vec<u8>>) -> #module::PTRes<Vec<u8>> {
+                    use ::futures::Future;
+                    let static_service = self.0.clone();
+                    match (req.method.clone(), req.uri.path()) {
+                        #( #handlers, )*
+                        _ => Box::new(::futures::future::ok(#module::TwirpError::new(::hyper::StatusCode::NOT_FOUND, "not_found", "Not found").to_resp_raw())),
+                    }
+                }
+            }
+        }
+    }
+
+    fn generate_server_struct(&self, service: &Service) -> TokenStream {
+        let name = self.service_name(service);
+        let server_name = self.server_name(service);
+
+        quote! {
+            pub struct #server_name<T: 'static + #name>(::std::sync::Arc<T>);
+        }
     }
 }
 
 impl ServiceGenerator for TwirpServiceGenerator {
     fn generate(&mut self, service: Service, buf: &mut String) {
-        self.generate_type_aliases(buf);
-        self.generate_main_trait(&service, buf);
-        self.generate_main_impl(&service, buf);
-        self.generate_client_struct(&service, buf);
-        self.generate_client_impl(&service, buf);
-        self.generate_server_struct(&service, buf);
-        self.generate_server_impl(&service, buf);
+        let mut tokens = TokenStream::new();
+
+        tokens.extend(self.generate_type_aliases());
+        tokens.extend(self.generate_main_trait(&service));
+        tokens.extend(self.generate_main_impl(&service));
+
+        tokens.extend(self.generate_client_struct(&service));
+        tokens.extend(self.generate_client_impl(&service));
+
+        tokens.extend(self.generate_server_struct(&service));
+        tokens.extend(self.generate_server_impl(&service));
+
+        write!(buf, "{}", &tokens).unwrap();
     }
 
     fn finalize(&mut self, buf: &mut String) {
-        if self.embed_client {
-            buf.push_str("\n/// Embedded module from prost_twirp source\n#[allow(dead_code)]\nmod prost_twirp {\n");
-            for line in include_str!("service_run.rs").lines() {
-                buf.push_str(&format!("    {}\n", line));
-            }
-            buf.push_str("\n}\n");
-        }
     }
 }

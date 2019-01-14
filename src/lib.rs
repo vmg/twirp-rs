@@ -1,12 +1,13 @@
+#![recursion_limit="128"]
 extern crate prost;
 extern crate serde_json;
 
 #[cfg(feature = "service-gen")]
-extern crate prost_build;
+#[macro_use]
+extern crate quote;
 
 #[cfg(feature = "service-gen")]
 mod service_gen;
-
 
 #[cfg(feature = "service-gen")]
 pub use self::service_gen::TwirpServiceGenerator;
