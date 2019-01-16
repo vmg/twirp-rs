@@ -8,11 +8,16 @@ use std::fmt::Write;
 #[derive(Default)]
 pub struct TwirpServiceGenerator {
     pub embed_client: bool,
-    type_aliases_generated: bool,
 }
 
 impl TwirpServiceGenerator {
     pub fn new() -> Self { Default::default() }
+
+    #[allow(dead_code)]
+    fn comment(&self, comment: &str) -> TokenStream {
+        use std::str::FromStr;
+        TokenStream::from_str(comment).unwrap()
+    }
 
     fn ident(&self, id: &str) -> Ident {
         Ident::new(id, Span::call_site())
@@ -68,7 +73,7 @@ impl TwirpServiceGenerator {
         let methods = service.methods.iter().map(|method| self.method_sig(method));
 
         quote! {
-            pub trait #name {
+            pub trait #name: Sync + Send {
                 #( #methods; )*
             }
         }
@@ -86,68 +91,56 @@ impl TwirpServiceGenerator {
                     Box::new(#client_name(#module::HyperClient::new(client, root_url)))
                 }
 
-                pub fn new_server<T: 'static + #name>(v: T) ->
-                    Box<::hyper::service::Service<
-                        ReqBody=::hyper::Body,
-                        ResBody=::hyper::Body,
-                        Error=::hyper::Error,
-                        Future=Box<::futures::Future<Item=::hyper::Response<::hyper::Body>, Error=::hyper::Error>>
-                    >> {
-                    Box::new(#module::HyperServer::new(#server_name(::std::sync::Arc::new(v))))
+                pub fn new_server<T: 'static + #name>(v: T) -> #module::HyperServer<#server_name<T>> {
+                    #module::HyperServer::new(#server_name(::std::sync::Arc::new(v)))
                 }
             }
         }
     }
 
-    fn generate_client_struct(&self, service: &Service) -> TokenStream {
-        let client_name = self.client_name(service);
+    fn generate_client(&self, service: &Service) -> TokenStream {
         let module = self.twirp_mod();
+        let name = self.service_name(service);
+        let client_name = self.client_name(service);
+
+        let methods = service.methods.iter().map(|method| {
+            let signature = self.method_sig(method);
+            let uri = self.twirp_uri(service, method);
+
+            quote! {
+                #signature {
+                    self.0.go(#uri, i)
+                }
+            }
+        });
 
         quote! {
             pub struct #client_name(pub #module::HyperClient);
-        }
-    }
 
-    fn client_method(&self, service: &Service, method: &Method) -> TokenStream {
-        let signature = self.method_sig(method);
-        let uri = self.twirp_uri(service, method);
-
-        quote! {
-            #signature {
-                self.0.go(#uri, i)
-            }
-        }
-    }
-
-    fn generate_client_impl(&self, service: &Service) -> TokenStream {
-        let name = self.service_name(service);
-        let client_name = self.client_name(service);
-        let methods = service.methods.iter().map(|method| self.client_method(service, method));
-
-        quote! {
             impl #name for #client_name {
                 #( #methods )*
             }
         }
     }
 
-    fn server_handler(&self, service: &Service, method: &Method) -> TokenStream {
-        let uri = self.twirp_uri(service, method);
-        let method = self.ident(&method.name);
-
-        quote! {
-            (::hyper::Method::POST, #uri) =>
-                Box::new(::futures::future::result(req.to_proto()).and_then(move |v| static_service.#method(v)).and_then(|v| v.to_proto_raw()))
-        }
-    }
-
-    fn generate_server_impl(&self, service: &Service) -> TokenStream {
+    fn generate_server(&self, service: &Service) -> TokenStream {
         let module = self.twirp_mod();
         let name = self.service_name(service);
         let server_name = self.server_name(service);
-        let handlers = service.methods.iter().map(|method| self.server_handler(service, method));
+
+        let handlers = service.methods.iter().map(|method| {
+            let uri = self.twirp_uri(service, method);
+            let method = self.ident(&method.name);
+
+            quote! {
+                (::hyper::Method::POST, #uri) =>
+                    Box::new(::futures::future::result(req.to_proto()).and_then(move |v| static_service.#method(v)).and_then(|v| v.to_proto_raw()))
+            }
+        });
 
         quote! {
+            pub struct #server_name<T: 'static + #name>(::std::sync::Arc<T>);
+
             impl<T: 'static + #name> #module::HyperService for #server_name<T> {
                 fn handle(&self, req: #module::ServiceRequest<Vec<u8>>) -> #module::PTRes<Vec<u8>> {
                     use ::futures::Future;
@@ -160,15 +153,6 @@ impl TwirpServiceGenerator {
             }
         }
     }
-
-    fn generate_server_struct(&self, service: &Service) -> TokenStream {
-        let name = self.service_name(service);
-        let server_name = self.server_name(service);
-
-        quote! {
-            pub struct #server_name<T: 'static + #name>(::std::sync::Arc<T>);
-        }
-    }
 }
 
 impl ServiceGenerator for TwirpServiceGenerator {
@@ -178,16 +162,9 @@ impl ServiceGenerator for TwirpServiceGenerator {
         tokens.extend(self.generate_type_aliases());
         tokens.extend(self.generate_main_trait(&service));
         tokens.extend(self.generate_main_impl(&service));
-
-        tokens.extend(self.generate_client_struct(&service));
-        tokens.extend(self.generate_client_impl(&service));
-
-        tokens.extend(self.generate_server_struct(&service));
-        tokens.extend(self.generate_server_impl(&service));
+        tokens.extend(self.generate_client(&service));
+        tokens.extend(self.generate_server(&service));
 
         write!(buf, "{}", &tokens).unwrap();
-    }
-
-    fn finalize(&mut self, buf: &mut String) {
     }
 }

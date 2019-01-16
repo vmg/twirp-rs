@@ -4,18 +4,18 @@ use hyper;
 use hyper::{Body, Client, HeaderMap, Version, Method, Request, Response, StatusCode, Uri};
 use hyper::client::HttpConnector;
 use hyper::header::{HeaderValue, CONTENT_TYPE, CONTENT_LENGTH};
-use hyper::service::Service;
+use hyper::service::{Service, NewService};
 use prost::{DecodeError, EncodeError, Message};
 use serde_json;
 use std::sync::Arc;
 
-pub type FutReq<T> = Box<Future<Item=ServiceRequest<T>, Error=ProstTwirpError>>;
+pub type FutReq<T> = Box<Future<Item=ServiceRequest<T>, Error=ProstTwirpError> + Send>;
 
 /// The type of every service request 
 pub type PTReq<I> = ServiceRequest<I>;
 
 /// The type of every service response
-pub type PTRes<O> = Box<Future<Item=ServiceResponse<O>, Error=ProstTwirpError>>;
+pub type PTRes<O> = Box<Future<Item=ServiceResponse<O>, Error=ProstTwirpError> + Send>;
 
 /// A request with HTTP info and the serialized input object
 #[derive(Debug)]
@@ -245,23 +245,25 @@ impl<T: Message + Default + 'static> ServiceResponse<T> {
 }
 
 /// A JSON-serializable Twirp error
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct TwirpError {
+    #[serde(skip)]
     pub status: StatusCode,
-    pub error_type: String,
+    pub code: String,
     pub msg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }
 
 impl TwirpError {
     /// Create a Twirp error with no meta
-    pub fn new(status: StatusCode, error_type: &str, msg: &str) -> TwirpError {
-        TwirpError::new_meta(status, error_type, msg, None)
+    pub fn new(status: StatusCode, code: &str, msg: &str) -> TwirpError {
+        TwirpError::new_meta(status, code, msg, None)
     }
 
     /// Create a Twirp error with optional meta
     pub fn new_meta(status: StatusCode, error_type: &str, msg: &str, meta: Option<serde_json::Value>) -> TwirpError {
-        TwirpError { status, error_type: error_type.to_string(), msg: msg.to_string(), meta }
+        TwirpError { status, code: error_type.to_string(), msg: msg.to_string(), meta }
     }
 
     /// Create a byte-array service response for this error and the given status code
@@ -288,35 +290,14 @@ impl TwirpError {
             body(Body::from(body)).unwrap()
     }
 
-    /// Create error from Serde JSON value
-    pub fn from_json(status: StatusCode, json: serde_json::Value) -> TwirpError {
-        let error_type = json["error_type"].as_str();
-        TwirpError {
-            status,
-            error_type: error_type.unwrap_or("<no code>").to_string(),
-            msg: json["msg"].as_str().unwrap_or("<no message>").to_string(),
-            // Put the whole thing as meta if there was no type
-            meta: if error_type.is_some() { json.get("meta").map(|v| v.clone()) } else { Some(json.clone()) },
-        }
-    }
-
     /// Create error from byte array
     pub fn from_json_bytes(status: StatusCode, json: &[u8]) -> serde_json::Result<TwirpError> {
-        serde_json::from_slice(json).map(|v| TwirpError::from_json(status, v))
-    }
-
-    /// Create Serde JSON value from error
-    pub fn to_json(&self) -> serde_json::Value {
-        let mut props = serde_json::map::Map::new();
-        props.insert("error_type".to_string(), serde_json::Value::String(self.error_type.clone()));
-        props.insert("msg".to_string(), serde_json::Value::String(self.msg.clone()));
-        if let Some(ref meta) = self.meta { props.insert("meta".to_string(), meta.clone()); }
-        serde_json::Value::Object(props)
+        serde_json::from_slice(json).map(|err| TwirpError{ status, ..err })
     }
 
     /// Create byte array from error
     pub fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
-        serde_json::to_vec(&self.to_json())
+        serde_json::to_vec(&self)
     }
 }
 
@@ -365,6 +346,37 @@ impl ProstTwirpError {
     }
 }
 
+#[cfg(test)]
+mod twirp_error_tests {
+    use super::*;
+
+    fn default_error() -> TwirpError {
+        TwirpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal".to_string(),
+            msg: "Something went wrong".to_string(),
+            meta: None,
+        }
+    }
+
+    fn default_json() -> &'static str {
+        r#"{"code":"internal","msg":"Something went wrong"}"#
+    }
+
+    #[test]
+    fn serialization() {
+        let err = default_error();
+        let json = TwirpError::to_json_bytes(&err).unwrap();
+        assert_eq!(String::from_utf8(json).unwrap(), default_json());
+    }
+
+    #[test]
+    fn deserialization() {
+        let err = TwirpError::from_json_bytes(StatusCode::INTERNAL_SERVER_ERROR, default_json().as_bytes());
+        assert_eq!(err.unwrap(), default_error());
+    }
+}
+
 /// A wrapper for a hyper client
 #[derive(Debug)]
 pub struct HyperClient {
@@ -404,7 +416,7 @@ impl HyperClient {
 }
 
 /// Service for taking a raw service request and returning a boxed future of a raw service response
-pub trait HyperService {
+pub trait HyperService: Send + Sync {
     /// Accept a raw service request and return a boxed future of a raw service response
     fn handle(&self, req: ServiceRequest<Vec<u8>>) -> PTRes<Vec<u8>>;
 }
@@ -422,11 +434,24 @@ impl<T: 'static + HyperService> HyperServer<T> {
     pub fn new(service: T) -> HyperServer<T> { HyperServer { service: Arc::new(service) } }
 }
 
+impl<T: 'static + HyperService> NewService for HyperServer<T> {
+    type ReqBody = Body;
+    type ResBody = Body;
+    type Error = hyper::Error;
+    type Service = Self;
+    type Future = Box<Future<Item=Self::Service, Error=Self::InitError> + Send>;
+    type InitError = hyper::Error;
+
+    fn new_service(&self) -> Box<Future<Item=Self::Service, Error=Self::InitError> + Send> {
+        Box::new(futures::future::ok(HyperServer { service: self.service.clone()}))
+    }
+}
+
 impl<T: 'static + HyperService> Service for HyperServer<T> {
     type ReqBody = Body;
     type ResBody = Body;
     type Error = hyper::Error;
-    type Future = Box<Future<Item = Response<Self::ResBody>, Error = Self::Error>>;
+    type Future = Box<Future<Item = Response<Self::ResBody>, Error = Self::Error> + Send>;
 
     fn call(&mut self, req: Request<Self::ReqBody>) -> Self::Future {
         if req.method() != &Method::POST {
@@ -435,10 +460,9 @@ impl<T: 'static + HyperService> Service for HyperServer<T> {
         }
 
         match req.headers().get(CONTENT_TYPE) {
-            Some(ct) => {
-
-            },
-            None => {
+            Some(ct) if ct == application_proto() => (),
+            Some(ct) if ct == application_json() => unimplemented!(),
+            _ => {
                 return Box::new(future::ok(TwirpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     "bad_content_type", "Content type must be application/protobuf").to_hyper_resp()))
             }
