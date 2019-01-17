@@ -4,6 +4,7 @@ extern crate proc_macro2;
 use prost_build::{Method, Service, ServiceGenerator};
 use proc_macro2::{TokenStream, Ident, Span, Literal};
 use std::fmt::Write;
+use std::process::{Command, Stdio};
 
 #[derive(Default)]
 pub struct TwirpServiceGenerator {
@@ -155,6 +156,45 @@ impl TwirpServiceGenerator {
     }
 }
 
+impl TwirpServiceGenerator {
+    fn render(&self, tokens: TokenStream, buf: &mut String) {
+        match TwirpServiceGenerator::rustfmt(&tokens) {
+            Ok(formatted) => buf.write_str(&formatted).unwrap(),
+            Err(_) => write!(buf, "{}", &tokens).unwrap(),
+        }
+    }
+
+
+    fn rustfmt(input: &TokenStream) -> Result<String, String> {
+        use std::io::Write;
+
+        let mut rustfmt = Command::new("rustfmt")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| format!("Couldn't spawn rustfmt"))?;
+
+        {
+            let stdin = rustfmt
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "Failed to open rustfmt stdin".to_string())?;
+
+            stdin.write_all(input.to_string().as_bytes())
+                .expect("failed to write input into rustfmt");
+        }
+
+        rustfmt
+            .wait_with_output()
+            .map_err(|err| format!("Error running rustfmt: {}", err))
+            .and_then(|out| {
+                String::from_utf8(out.stdout)
+                    .map_err(|_| "Formatted code is not valid UTF-8".to_string())
+            })
+    }
+}
+
+
 impl ServiceGenerator for TwirpServiceGenerator {
     fn generate(&mut self, service: Service, buf: &mut String) {
         let mut tokens = TokenStream::new();
@@ -165,6 +205,6 @@ impl ServiceGenerator for TwirpServiceGenerator {
         tokens.extend(self.generate_client(&service));
         tokens.extend(self.generate_server(&service));
 
-        write!(buf, "{}", &tokens).unwrap();
+        self.render(tokens, buf);
     }
 }
