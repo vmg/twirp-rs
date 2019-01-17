@@ -1,0 +1,17 @@
+[package]
+name = "example-service-gen"
+version = "0.1.0"
+authors = ["Chad Retz <chad.retz@gmail.com>"]
+build = "build.rs"
+
+[dependencies]
+bytes = "0.4"
+futures = "0.1"
+hyper = "0.12"
+prost = "0.4"
+prost-derive = "0.4"
+twirp-rs = { path = "../../" }
+
+[build-dependencies]
+prost-build = "0.4"
+twirp-rs = { path = "../../", features = ["service-gen"] }
