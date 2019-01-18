@@ -4,10 +4,8 @@ use hyper;
 use hyper::{Body, Client, HeaderMap, Version, Method, Request, Response, StatusCode, Uri};
 use hyper::client::HttpConnector;
 use hyper::header::{HeaderValue, CONTENT_TYPE, CONTENT_LENGTH};
-use hyper::service::{Service, NewService};
 use prost::{DecodeError, EncodeError, Message};
-use serde_json;
-use std::sync::Arc;
+use serde_derive::{Serialize, Deserialize};
 
 pub type FutReq<T> = Box<Future<Item=ServiceRequest<T>, Error=ProstTwirpError> + Send>;
 
@@ -344,6 +342,22 @@ impl ProstTwirpError {
             _ => self
         }
     }
+
+    pub fn to_hyper_resp(self) -> Result<Response<Body>, hyper::Error> {
+        match self.root_err() {
+            ProstTwirpError::ProstDecodeError(_) =>
+                Ok(TwirpError::new(StatusCode::BAD_REQUEST, "protobuf_decode_err", "Invalid protobuf body").
+                    to_hyper_resp()),
+            ProstTwirpError::TwirpError(err) =>
+                Ok(err.to_hyper_resp()),
+            // Just propagate hyper errors
+            ProstTwirpError::HyperError(err) =>
+                Err(err),
+            _ =>
+                Ok(TwirpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_err", "Internal Error").
+                    to_hyper_resp()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,76 +429,3 @@ impl HyperClient {
     }
 }
 
-/// Service for taking a raw service request and returning a boxed future of a raw service response
-pub trait HyperService: Send + Sync {
-    /// Accept a raw service request and return a boxed future of a raw service response
-    fn handle(&self, req: ServiceRequest<Vec<u8>>) -> PTRes<Vec<u8>>;
-}
-
-/// A wrapper for a `HyperService` trait that keeps a `Arc` version of the service
-pub struct HyperServer<T: HyperService> {
-    /// The `Arc` version of the service
-    /// 
-    /// Needed because of [hyper Service lifetimes](https://github.com/tokio-rs/tokio-service/issues/9)
-    pub service: Arc<T>
-}
-
-impl<T: 'static + HyperService> HyperServer<T> {
-    /// Create a new service wrapper for the given impl
-    pub fn new(service: T) -> HyperServer<T> { HyperServer { service: Arc::new(service) } }
-}
-
-impl<T: 'static + HyperService> NewService for HyperServer<T> {
-    type ReqBody = Body;
-    type ResBody = Body;
-    type Error = hyper::Error;
-    type Service = Self;
-    type Future = Box<Future<Item=Self::Service, Error=Self::InitError> + Send>;
-    type InitError = hyper::Error;
-
-    fn new_service(&self) -> Box<Future<Item=Self::Service, Error=Self::InitError> + Send> {
-        Box::new(futures::future::ok(HyperServer { service: self.service.clone()}))
-    }
-}
-
-impl<T: 'static + HyperService> Service for HyperServer<T> {
-    type ReqBody = Body;
-    type ResBody = Body;
-    type Error = hyper::Error;
-    type Future = Box<Future<Item = Response<Self::ResBody>, Error = Self::Error> + Send>;
-
-    fn call(&mut self, req: Request<Self::ReqBody>) -> Self::Future {
-        if req.method() != &Method::POST {
-            return Box::new(future::ok(TwirpError::new(StatusCode::METHOD_NOT_ALLOWED, "bad_method",
-                "Method must be POST").to_hyper_resp()));
-        }
-
-        match req.headers().get(CONTENT_TYPE) {
-            Some(ct) if ct == application_proto() => (),
-            Some(ct) if ct == application_json() => unimplemented!(),
-            _ => {
-                return Box::new(future::ok(TwirpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "bad_content_type", "Content type must be application/protobuf").to_hyper_resp()))
-            }
-        }
-
-        // Ug: https://github.com/tokio-rs/tokio-service/issues/9
-        let service = self.service.clone();
-        Box::new(ServiceRequest::from_hyper_raw(req).
-            and_then(move |v| service.handle(v)).
-            map(|v| v.to_hyper_raw()).
-            or_else(|err| match err.root_err() {
-                ProstTwirpError::ProstDecodeError(_) =>
-                    Ok(TwirpError::new(StatusCode::BAD_REQUEST, "protobuf_decode_err", "Invalid protobuf body").
-                        to_hyper_resp()),
-                ProstTwirpError::TwirpError(err) =>
-                    Ok(err.to_hyper_resp()),
-                // Just propagate hyper errors
-                ProstTwirpError::HyperError(err) =>
-                    Err(err),
-                _ =>
-                    Ok(TwirpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_err", "Internal Error").
-                        to_hyper_resp()),
-            }))
-    }
-}

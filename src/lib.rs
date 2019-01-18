@@ -1,14 +1,4 @@
-#![recursion_limit="128"]
-extern crate prost;
-
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-
-#[cfg(feature = "service-gen")]
-#[macro_use]
-extern crate quote;
+#![recursion_limit="256"]
 
 #[cfg(feature = "service-gen")]
 mod service_gen;
