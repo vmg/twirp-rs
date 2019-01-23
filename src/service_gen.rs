@@ -127,7 +127,7 @@ impl TwirpServiceGenerator {
                     type ResponseFuture = Box<Future<Item=Response<Body>, Error=ProstTwirpError> + Send>;
 
                     match req.headers().get(::hyper::header::CONTENT_TYPE) {
-                        Some(ct) if ct == "application/proto" => (),
+                        Some(ct) if ct == "application/protobuf" => (),
                         Some(ct) if ct == "application/json" => (),
                         _ => {
                             return Box::new(future::ok(TwirpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -139,7 +139,7 @@ impl TwirpServiceGenerator {
                         #module::ServiceRequest::from_hyper_raw(req).and_then(move |req| -> ResponseFuture {
                             match (req.method.clone(), req.uri.path()) {
                                 #( #handlers, )*
-                                _ => { Box::new(future::ok(TwirpError::new(StatusCode::NOT_FOUND, "not_found", "Not found no").to_hyper_resp())) }
+                                _ => { Box::new(future::ok(TwirpError::new(StatusCode::NOT_FOUND, "not_found", "RPC Path not found").to_hyper_resp())) }
                             }
                         }).or_else(|err| err.to_hyper_resp())
                     )
