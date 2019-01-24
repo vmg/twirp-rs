@@ -181,8 +181,10 @@ impl TwirpServiceGenerator {
             .wait_with_output()
             .map_err(|err| format!("Error running rustfmt: {}", err))
             .and_then(|out| {
-                String::from_utf8(out.stdout)
-                    .map_err(|_| "Formatted code is not valid UTF-8".to_string())
+                match out.status.success() {
+                    true => String::from_utf8(out.stdout).map_err(|_| "Formatted code is not valid UTF-8".to_string()),
+                    false => Err("rustfmt did not exit successfully".to_owned())
+                }
             })
     }
 }
