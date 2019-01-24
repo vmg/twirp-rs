@@ -66,7 +66,7 @@ impl TwirpServiceGenerator {
         let methods = service.methods.iter().map(|method| self.method_sig(method));
 
         quote! {
-            pub trait #name: Sync + Send {
+            pub trait #name: Send {
                 #( #methods; )*
             }
         }
